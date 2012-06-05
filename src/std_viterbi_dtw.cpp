@@ -12,6 +12,7 @@
 #include "query_vite_runner.h"
 #include "parm.h"
 #include "dtw_util.h"
+#include "query_hmm.h"
 
 using std::string;
 
@@ -89,7 +90,7 @@ void ParseArg(const int argc, const char **argv,/*{{{*/
 
 
 void CopyFeatPtr(const vector<Parm>& parm_vec,/*{{{*/
-                 vector<const Feature*>* targ_feat_vec) {
+                 vector<const DenseFeature*>* targ_feat_vec) {
   targ_feat_vec->resize(parm_vec.size());
   for (unsigned i = 0; i < parm_vec.size(); ++i)
     (*targ_feat_vec)[i] = &parm_vec[i].Feat();
@@ -214,7 +215,7 @@ class PrfDtwBatchParamSet : public DtwBatchParamSet {/*{{{*/
 };/*}}}*/
 
 bool PrfDtwBatchParamSet::InstallDtwRunner(DtwRunner* runner) {/*{{{*/
-  
+
   UTriple* ticket = dispatcher_->GetObjPtr();
   if (ticket) {
     const int qidx = ticket->qidx;
@@ -254,13 +255,14 @@ void PrfDtwBatchParamSet::IntegratePrfDist(/*{{{*/
       SnippetProfile& snippet = (*old_snippet_lists)[qidx].ProfileRef(sidx);
       vector<vector<float> >& dist_vec = output_dist_[qidx][sidx];
 
-      /* Colloct them in a single vector, namely, output_dist_[qidx][sidx][0] */
-      if (dist_vec[0].empty()) dist_vec[0].push_back(-float_inf);
-      for (unsigned pidx = 1; pidx < (*num_prf_)[qidx]; ++pidx) {
-        if (dist_vec[pidx].empty()) { // Cannot find path with PRF(pidx)
-          dist_vec[0].push_back(-float_inf);
-        } else {
-          dist_vec[0].push_back(dist_vec[pidx][0]);
+      if (dist_vec[0].size() < (*num_prf_)[qidx]) {
+        /* Colloct them in a single vector, namely, output_dist_[qidx][sidx][0] */
+        if (dist_vec[0].empty()) dist_vec[0].push_back(-float_inf);
+        for (unsigned pidx = 1; pidx < (*num_prf_)[qidx]; ++pidx) {
+          if (dist_vec[pidx].empty()) // Cannot find path with PRF(pidx)
+            dist_vec[0].push_back(-float_inf);
+          else
+            dist_vec[0].push_back(dist_vec[pidx][0]);
         }
       }
 
@@ -292,6 +294,7 @@ void GeneratePrfWeight(const float prf_lambda, vector<float>* prf_weight) {/*{{{
     sum += (*prf_weight)[pidx];
   }
 
+  /*
   float normalizer = 3.0 / sum;
   cout << "PRF weight = {";
   for (unsigned pidx = 0; pidx < prf_weight->size(); ++pidx) {
@@ -299,12 +302,13 @@ void GeneratePrfWeight(const float prf_lambda, vector<float>* prf_weight) {/*{{{
     cout << " " << (*prf_weight)[pidx];
   }
   cout << "}\n";
+  */
 }/*}}}*/
 
 
-void InitPrfDispatcher(const vector<SnippetProfileList>& candidates,/*{{{*/
-                       const vector<unsigned>& num_prf,
-                       Dispatcher<UTriple>* prf_dispatcher) {
+void InitPrfDispatcher(Dispatcher<UTriple>* prf_dispatcher, /*{{{*/
+                       const vector<SnippetProfileList>& candidates,
+                       const vector<unsigned>& num_prf) {
 
   prf_dispatcher->Clear();
 
@@ -318,6 +322,63 @@ void InitPrfDispatcher(const vector<SnippetProfileList>& candidates,/*{{{*/
   }
 
 }/*}}}*/
+
+void InitTrainerDispatcher(Dispatcher<pair<unsigned, int8_t> >* trainer_disp, /*{{{*/
+                           const vector<SnippetProfileList>& candidates) {
+  for (unsigned qidx = 0; qidx < candidates.size(); ++qidx) {
+    trainer_disp->Push(make_pair<unsigned, int8_t>(qidx, 0));
+    trainer_disp->Push(make_pair<unsigned, int8_t>(qidx, 1));
+  }
+}/*}}}*/
+
+/* score[i] >= t
+ * score[i + 1] < t
+ */
+unsigned ScoreSearch(const SnippetProfileList& snippet_list, float t,
+                     int l = 0, int h = INT_MAX) {
+  int low = max(l, 0);
+  int high = min(h, static_cast<int>(snippet_list.size()) - 1);
+  assert(low <= high);
+
+  while (low < high) {
+    int mid = (low + high + 1) / 2;
+    if (snippet_list.GetProfile(mid).Score() >= t) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return low;
+}
+
+void SnippetListStat(const SnippetProfileList& snippet_list,
+                     float* p_mean, float* p_std,
+                     unsigned begin = 0, unsigned end = -1) {
+
+  float& mean = *p_mean;
+  float& std = *p_std;
+
+  if (end < 0 || end > snippet_list.size()) end = snippet_list.size();
+  if (begin < 0 || begin >= snippet_list.size()) begin = 0;
+  int n = end - begin;
+
+  if (n == 1) {
+    mean = snippet_list.GetProfile(begin).Score();
+    std = 0.0f;
+  } else {
+    mean = 0.0f;
+    std = 0.0f;
+    for (unsigned s = begin; s < end; ++s) {
+      float score = snippet_list.GetProfile(s).Score();
+      mean += score;
+      std += score * score;
+    }
+    mean /= (end - begin);
+    std = sqrt(std / n - mean * mean);
+  }
+}
+
 
 
 void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
@@ -359,8 +420,9 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
   Dispatcher<UPair> dispatcher;
 
   vector<Parm> query_parm;             // Query parm
-  vector<const Feature*> pquery_feat;
+  vector<const DenseFeature*> pquery_feat;
   vector<Parm> doc_parm;               // Query parm
+  vector<const DenseFeature*> pdoc_feat;
   vector<Labfile> doc_lab;
   QDArray<vector<float> > snippet_like;
   QDArray<vector<Labfile> > query_to_doc_lab;
@@ -389,10 +451,6 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
 
   //for_each(doc_list.begin(), doc_list.end(), Printer());
 
-  dispatcher.Verbose();
-  dispatcher.SetVerboseInt(doc_list.size() / 2);
-
-
   tid = timer.Tic("Loading HMMs");
   LoadHMMGMG(s_loadparam, &bg_model, state_pool, gauss_pool);
   bg_model.SyncUsed();
@@ -405,6 +463,7 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
   DtwUtil::LoadParmList(query_list, s_querydir, &query_parm, DtwUtil::FRAME);
   DtwUtil::LoadParmList(doc_list, s_docdir, &doc_parm, DtwUtil::FRAME);
   CopyFeatPtr(query_parm, &pquery_feat);
+  CopyFeatPtr(doc_parm, &pdoc_feat);
   timer.Toc(tid);
 
 
@@ -424,6 +483,8 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
 
   /* Init QueryViteRunner's Dispatcher */
   InitDispatcher(&dispatcher, q_profile_list, doc_list);
+  dispatcher.Verbose();
+  dispatcher.SetVerboseInt(dispatcher.size() / 50);
 
 
   /* Create ParamSet  */
@@ -474,57 +535,37 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
       /* In each captured snippet */
       for (unsigned s = 0; s < snippet_like(qidx, didx).size(); ++s) {
         Labfile& lab = query_to_doc_lab(qidx, didx)[s];
-        /*FIXME extend both ends */
         IPair bound = IPair(doc_lab[didx].getStartF(lab.getCluster(0)),
                             doc_lab[didx].getEndF(lab.getCluster(-1)));
         vite_snippet_lists[qidx].push_back(
             qidx, didx, s, snippet_like(qidx, didx)[s], bound);
-        if (s == 0) {
-          vite_all_snp_lists[qidx].push_back(
-              qidx, didx, s, snippet_like(qidx, didx)[s], bound);
-        }
       }
     }
-    const int FDtwNRescore = min(500u, vite_snippet_lists[qidx].size());
+    const unsigned FDtwNRescore = min(500u, vite_snippet_lists[qidx].size());
     //cout << "vite_snippet_lists[" << qidx << "] = \n" << vite_snippet_lists[qidx];
     vite_snippet_lists[qidx].Sort();
-    cout << "Q" << qidx << ": Reduce search snippets from "
-      << vite_snippet_lists[qidx].size() << " to " << FDtwNRescore
-      << " for fDTW " << endl;
+    vite_all_snp_lists[qidx] = vite_snippet_lists[qidx];
+
+    if (FDtwNRescore < vite_snippet_lists[qidx].size()) {
+      cout << "Q" << qidx << ": Reduce search snippets from "
+        << vite_snippet_lists[qidx].size() << " to " << FDtwNRescore
+        << " for fDTW " << endl;
+    }
     vite_snippet_lists[qidx].Resize(FDtwNRescore);
 
-    vite_all_snp_lists[qidx].Sort();
   }
 
 
   vector<const vector<SnippetProfileList>* > v_snp_lists;
+
+#ifdef PARTIAL_RESULTS
   v_snp_lists.push_back(&vite_all_snp_lists);
   DumpResult(s_resultfile + ".vite",
              q_profile_list,
              v_snp_lists,
              doc_list,
              &ans_list);
-
-#ifdef PARTIAL_RESULTS
-  /*
-  for (int n = 4000; n >= 500; n-=500) {
-    string s;
-    stringstream ss(s);
-    ss << n;
-    cout << s_resultfile + ".recallvite" + ss.str() << endl;
-
-    for (unsigned qidx = 0; qidx < vite_snippet_lists.size(); ++qidx)
-      vite_snippet_lists[qidx].Resize(n);
-
-    DumpResult(s_resultfile + ".recallvite" + ss.str(),
-               q_profile_list,
-               vite_snippet_lists,
-               doc_list,
-               &ans_list);
-  }
-  */
 #endif
-
 
   /**************************** Frame-based DTW *******************************/
 
@@ -569,7 +610,7 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
 
 
   vector<SnippetProfileList> dtw_snippet_lists(vite_snippet_lists.size());
-  vector<SnippetProfileList> dtw_all_lists(vite_snippet_lists.size());
+  vector<SnippetProfileList> dtw_all_snp_lists(vite_snippet_lists.size());
 
   /* Change score and boundary according to frame-based DTW */
   for (unsigned qidx = 0; qidx < vite_snippet_lists.size(); ++qidx) {
@@ -588,27 +629,31 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
       }
     }
 
-    const int PrfNRescore = min(250u, dtw_snippet_lists[qidx].size());
+    const unsigned PrfNRescore = min(500u, dtw_snippet_lists[qidx].size());
 
     dtw_snippet_lists[qidx].Sort();
-    dtw_all_lists[qidx] = dtw_snippet_lists[qidx];
-    cout << "Q" << qidx << ": Reduce search snippets from "
-      << dtw_snippet_lists[qidx].size() << " to " << PrfNRescore
-      << " for PRF" << endl;
+    dtw_all_snp_lists[qidx] = dtw_snippet_lists[qidx];
+
+    if (PrfNRescore < dtw_snippet_lists[qidx].size()) {
+      cout << "Q" << qidx << ": Reduce search snippets from "
+        << dtw_snippet_lists[qidx].size() << " to " << PrfNRescore
+        << " for PRF" << endl;
+    }
     dtw_snippet_lists[qidx].Resize(PrfNRescore);
-    //cout << "dtw_snippet_lists[" << qidx << "] = \n" << dtw_snippet_lists[qidx];
   }
 
-  v_snp_lists.push_back(&dtw_all_lists);
+#ifdef PARTIAL_RESULTS
+  v_snp_lists.push_back(&dtw_all_snp_lists);
   DumpResult(s_resultfile + ".fdtw",
              q_profile_list,
              v_snp_lists,
              doc_list,
              &ans_list);
+#endif
 
 
 
-  /********************************* PRF ********************************/
+  /********************************* PRF **************************************/
 
   /* Input variables */
   const int fix_num_prf = 7;
@@ -618,11 +663,14 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
   GeneratePrfWeight(prf_lambda, &prf_weight);
   Dispatcher<UTriple> prf_dispatcher;
 
+
+  cout << "PRF weight = " << prf_weight << endl;
+
   /* Output variables */
   vector<vector<float> > prf_dist;
 
   /* Init dispatcher */
-  InitPrfDispatcher(dtw_snippet_lists, num_prf, &prf_dispatcher);
+  InitPrfDispatcher(&prf_dispatcher, dtw_snippet_lists, num_prf);
   prf_dispatcher.Verbose();
   prf_dispatcher.SetVerboseInt(prf_dispatcher.size() / 50);
 
@@ -655,14 +703,106 @@ void Std_viterbi_dtw(C_AngusoArgParser& arg_parser) {/*{{{*/
   /* New Scores from PRF */
   prf_batch_param.IntegratePrfDist(prf_weight, &prf_snippet_lists);
 
-
+#ifdef PARTIAL_RESULTS
   v_snp_lists.push_back(&prf_snippet_lists);
   DumpResult(s_resultfile + ".prf",
              q_profile_list,
              v_snp_lists,
              doc_list,
              &ans_list);
+#endif
 
+  /********************************* Query HMMs *******************************/
+  /* Input data */
+  Dispatcher<pair<unsigned, int8_t> > train_disp;
+  InitDispatcher(&dispatcher, prf_snippet_lists);
+  InitTrainerDispatcher(&train_disp, prf_snippet_lists);
+  train_disp.Verbose();
+  train_disp.SetVerboseInt(train_disp.size() / 50);
+
+  /* New statepool and gausspool */
+  vector<GaussianMixture*> a_state_pool; // State Pool
+  vector<Gaussian*> a_gauss_pool;        // Gaussian Pool
+  bg_model.setpStatePool(&a_state_pool, UNUSE);
+  bg_model.setpGaussPool(&a_gauss_pool, UNUSE);
+
+  /* Calculate num_prf */
+  vector<UPair> irr_range(prf_snippet_lists.size());
+  for (unsigned qidx = 0; qidx < prf_snippet_lists.size(); ++qidx) {
+    float mean, std;
+    SnippetListStat(prf_snippet_lists[qidx], &mean, &std);
+    num_prf[qidx] = ScoreSearch(prf_snippet_lists[qidx], mean + 1.9 * std);
+    irr_range[qidx].first =
+      ScoreSearch(prf_snippet_lists[qidx], mean + 0.25 * std, num_prf[qidx]);
+    irr_range[qidx].second =
+      ScoreSearch(prf_snippet_lists[qidx], mean - 0.25 * std, irr_range[qidx].first);
+    cout << qidx << setprecision(2) << ": (" << mean << ", " << std << "), "
+      << num_prf[qidx] << ", "
+      << irr_range[qidx].first << " - " << irr_range[qidx].second
+      << "(" << irr_range[qidx].second - irr_range[qidx].first + 1
+      << ")" << endl;
+  }
+
+  /* Calculate train_weight */
+  const float hmm_lambda = 0.25;
+  vector<float> hmm_weight(50);
+  GeneratePrfWeight(hmm_lambda, &hmm_weight);
+  cout << "HMM weight = " << hmm_weight << endl;
+  vector<vector<float> > train_weight(prf_snippet_lists.size(), hmm_weight);
+  vector<vector<float> > targ_loglike;
+  vector<vector<float> > anti_loglike;
+
+  QueryHmmParamSet query_hmm_set(
+      &train_disp,
+      &pquery_feat,
+      &pdoc_feat,
+      &prf_snippet_lists,
+      &num_prf,
+      &train_weight,
+      &irr_range,
+      &doc_lab,
+      &bg_model,
+      20, // max_iter
+      &targ_loglike,
+      &anti_loglike);
+
+  vector<QueryHmmTrainer> trainer(nthread);
+  vector<QueryHmmDecoder> decoder(nthread);
+  vector<QueryHmmManager> query_hmm_man(nthread);
+  for (unsigned t = 0; t < nthread; ++t) {
+    query_hmm_man[t].Install(&query_hmm_set, &trainer[t], &decoder[t]);
+  }
+
+  cout << "Query HMM:\n";
+  tid = timer.Tic("QueryHmm");
+  CastThreads(query_hmm_man);
+  timer.Toc(tid);
+  cout << "\n";
+
+  vector<SnippetProfileList> hmm_snippet_lists(prf_snippet_lists);
+  for (unsigned qidx = 0; qidx < hmm_snippet_lists.size(); ++qidx) {
+
+    int n_not_found = 0;
+    for (unsigned sidx = 0; sidx < hmm_snippet_lists[qidx].size(); ++sidx) {
+      hmm_snippet_lists[qidx].ProfileRef(sidx).ScoreRef() =
+        targ_loglike[qidx][sidx] - anti_loglike[qidx][sidx];
+    }
+
+    hmm_snippet_lists[qidx].Sort();
+    if (n_not_found > 0) {
+      cerr << qidx << ": not found = " << n_not_found << endl;
+      hmm_snippet_lists[qidx].Resize(-n_not_found);
+    }
+
+  }
+
+  v_snp_lists.push_back(&hmm_snippet_lists);
+  DumpResult(s_resultfile + ".hmm",
+             q_profile_list,
+             v_snp_lists,
+             doc_list,
+             &ans_list);
+  /********************************** End *************************************/
   /* Print running time information */
   timer.Print();
 

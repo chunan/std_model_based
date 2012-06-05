@@ -10,7 +10,7 @@ vpath %.h   include
 
 .PHONY: all clean mk_machine_dir
 
-BAREOBJ = query_vite_runner.o dtw_util.o parm.o segtree.o
+BAREOBJ = query_vite_runner.o dtw_util.o query_hmm.o
 OBJ = $(addprefix obj/, $(BAREOBJ))
 
 TARGET = bin/std_viterbi_dtw
@@ -18,7 +18,7 @@ TARGET = bin/std_viterbi_dtw
 
 all: CFLAGS += -O2 -DLOGGING
 
-debug: CFLAGS += -g -p -DLOGGING
+debug: CFLAGS += -g -DLOGGING
 
 all: mk_machine_dir $(TARGET)
 
@@ -29,14 +29,16 @@ mk_machine_dir:
 	@mkdir -p bin/
 
 bin/std_viterbi_dtw: LDFLAGS += -pthread \
-	-lhmmlite \
-	-latlas_wrapper \
-	-latlas_wrapper_type \
-	-llapack \
-	-llapack_atlas \
-	-languso_arg_parser \
-	-lfeature \
-	-lugoc_utility
+	-l hmmlite \
+	-l atlas_wrapper \
+	-l atlas_wrapper_type \
+	-l lapack \
+	-l lapack_atlas \
+	-l anguso_arg_parser \
+	-l parm \
+	-l feature \
+	-l segtree \
+	-l ugoc_utility
 
 obj/%.o: src/%.cpp include/%.h
 	${CC} ${CFLAGS} $< -c -o $@ ${LDFLAGS} $(LDPATH)
